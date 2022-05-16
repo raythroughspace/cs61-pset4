@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <climits>
 #include <cerrno>
+#include <sys/mman.h>
 
 // io61.c
 //    YOUR CODE HERE!
@@ -14,6 +15,9 @@
 struct io61_file {
     int fd;
     int mode;
+    unsigned char* file_data; //mmap return pointer
+    size_t file_size;
+    size_t mmap_pos; //If file is mmaped, it is the offset of next char to read/write (all other off_sets are no longer used)
     static constexpr off_t bufsize = 4096; // block size for this cache
     unsigned char cbuf[bufsize];
     // These “tags” are addresses—file offsets—that describe the cache’s contents.
@@ -29,11 +33,18 @@ struct io61_file {
 //    write-only file. You need not support read/write files.
 
 io61_file* io61_fdopen(int fd, int mode) {
-    assert(fd >= 0);
-    assert(mode == O_RDONLY || mode == O_WRONLY);
     io61_file* f = new io61_file;
     f->fd = fd;
     f->mode = mode;
+    f->pos_tag = f->end_tag = f->tag = f->mmap_pos = 0;
+    f->file_size = io61_filesize(f);
+    if (f->file_size != (size_t) -1){
+        int prot = f->mode == O_RDONLY ? PROT_READ : PROT_WRITE;
+        f->file_data = (unsigned char*) mmap(nullptr, f->file_size, prot, MAP_SHARED, f->fd, 0);
+    }
+    else{
+        f->file_data = (unsigned char*) MAP_FAILED;
+    }
     return f;
 }
 
@@ -42,8 +53,11 @@ io61_file* io61_fdopen(int fd, int mode) {
 //    Close the io61_file `f` and release all its resources.
 
 int io61_close(io61_file* f) {
-    if (f->mode == O_WRONLY){
+    if (f->mode == O_WRONLY && f->file_data == (unsigned char*) MAP_FAILED){
         io61_flush(f);
+    }
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+         munmap(f->file_data, f->file_size);
     }
     int r = close(f->fd);
     delete f;
@@ -55,7 +69,6 @@ int io61_fill(io61_file* f) {
     // Only called for read caches.
 
     // Check invariants.
-    assert(f->mode == O_RDONLY);
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
 
@@ -78,6 +91,14 @@ int io61_fill(io61_file* f) {
 
 int io61_readc(io61_file* f) {
     unsigned char buf[1];
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+        if (f->mmap_pos >= f->file_size){
+            return -1;
+        }
+        buf[0] = f->file_data[f->mmap_pos];
+        ++f->mmap_pos;
+        return buf[0];
+    }
     if (f->end_tag == f->pos_tag){
         int r = io61_fill(f);
         if (f->end_tag == f->pos_tag || r < 0){ //EOF or error
@@ -97,6 +118,17 @@ int io61_readc(io61_file* f) {
 //    were read.
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+        if (f->mmap_pos >= f->file_size){
+            return -1;
+        }
+        if (sz + f->mmap_pos > f->file_size){
+            sz = f->file_size - f->mmap_pos; //short read
+        }
+        memcpy(buf, &f->file_data[f->mmap_pos], sz);
+        f->mmap_pos += sz;
+        return sz;
+    }
     // Check invariants.
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
@@ -133,6 +165,14 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    -1 on error.
 
 int io61_writec(io61_file* f, int ch) {
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+        if (f->mmap_pos >= f->file_size){
+            return -1;
+        }
+        f->file_data[f->mmap_pos] = (unsigned char) ch;
+        ++f->mmap_pos;
+        return 0;
+    }
     // Check invariants.
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
@@ -161,6 +201,17 @@ int io61_writec(io61_file* f, int ch) {
 //    an error occurred before any characters were written.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+        if (f->mmap_pos >= f->file_size){
+            return -1; //nothing to write
+        }
+        if (sz + f->mmap_pos > f->file_size){
+            sz = f->file_size - f->mmap_pos; //short read
+        }
+        memcpy(&f->file_data[f->mmap_pos],buf, sz);
+        f->mmap_pos += sz;
+        return sz;
+    }
     // Check invariants.
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
@@ -209,12 +260,18 @@ int io61_flush(io61_file* f) {
     return r;
 }
 
-
 // io61_seek(f, pos)
 //    Change the file pointer for file `f` to `pos` bytes into the file.
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t pos) {
+    if (f->file_data != (unsigned char*) MAP_FAILED){
+        if (pos < 0 || pos >= f->file_size){
+            return -1;
+        }
+        f->mmap_pos = pos;
+        return 0;
+    }
     if (f->mode == O_WRONLY){
         io61_flush(f);
         off_t r = lseek(f->fd, (off_t) pos, SEEK_SET);
@@ -251,7 +308,6 @@ int io61_seek(io61_file* f, off_t pos) {
     return 0;
 
 }
-
 
 // You shouldn't need to change these functions.
 
